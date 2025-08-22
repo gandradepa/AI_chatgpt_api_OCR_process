@@ -33,7 +33,7 @@ os.makedirs(output_folder, exist_ok=True)
 os.makedirs(debug_folder, exist_ok=True)
 
 # NEW: DB path (SQLite)
-DB_PATH = r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\QR_code_project\asset_capture_app\data\QR_codes.db"
+DB_PATH = r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\Git_control\asset_capture_app_dev\data\QR_codes.db"
 DB_TABLE = "QR_codes"  # precisa conter QR_code_ID e Approved
 
 VALID_SUFFIXES = {"0", "1", "3"}

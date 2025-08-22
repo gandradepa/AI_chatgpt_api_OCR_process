@@ -33,8 +33,10 @@ output_folder = r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. 
 os.makedirs(output_folder, exist_ok=True)
 
 # NEW: DB path (SQLite)
-DB_PATH = r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\QR_code_project\asset_capture_app\data\QR_codes.db"
-DB_TABLE = "QR_codes"  # must contain columns: QR_code_ID (TEXT) and Approved (INTEGER or TEXT)
+DB_PATH  = r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\Git_control\asset_capture_app_dev\data\QR_codes.db"
+DB_TABLE = "sdi_dataset"   # uses a spaced QR column name: "QR Code"
+QR_COL   = '"QR Code"'     # quoted identifier for SQLite
+APPROVED_COL = '"Approved"'
 
 VALID_SUFFIXES = {"0", "1", "3"}
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -49,43 +51,44 @@ FIELD_SOURCES: Dict[str, List[str]] = {
     "Diameter": ["0", "1"],
 }
 
-# --- [2.1] DB helpers (NEW) ---
-def load_approved_qrs(db_path: str, table: str = "QR_codes") -> set:
+# --- [2.1] DB helpers (filter to Approved <> 1) ---
+def load_disallowed_qrs(db_path: str, table: str, qr_col: str, approved_col: str) -> set:
     """
-    Returns a set of QR_code_ID (strings) where Approved == 1.
-    Works whether 'Approved' is stored as INTEGER 1 or TEXT '1'.
+    Return a set of QR values that should be SKIPPED (i.e., Approved == 1).
+    We compare as TEXT to catch integer 1 and string '1'.
     """
-    approved = set()
+    to_skip = set()
     if not os.path.exists(db_path):
         print(f"⚠ DB not found at: {db_path}. Proceeding without approval filter.")
-        return approved
+        return to_skip
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             with closing(conn.cursor()) as cur:
-                cur.execute(f"""
-                    SELECT QR_code_ID
-                    FROM {table}
-                    WHERE (Approved = 1 OR Approved = '1')
-                """)
+                # Approved == 1 (int) or '1' (text) → skip
+                sql = f"""
+                    SELECT {qr_col} AS qr
+                    FROM "{table}"
+                    WHERE CAST({approved_col} AS TEXT) = '1'
+                """
+                cur.execute(sql)
                 for row in cur.fetchall():
-                    # Keep as zero-padded string exactly as stored
-                    qrid = str(row["QR_code_ID"]).strip()
+                    qrid = str(row["qr"]).strip()
                     if qrid:
-                        approved.add(qrid)
+                        to_skip.add(qrid)
     except Exception as e:
         print(f"⚠ Error reading approvals from DB: {e}. Proceeding without approval filter.")
-    return approved
+    return to_skip
 
-APPROVED_QRS = load_approved_qrs(DB_PATH, DB_TABLE)
-if APPROVED_QRS:
-    print(f"Approval filter loaded: {len(APPROVED_QRS)} QR(s) will be skipped.")
+SKIP_QRS = load_disallowed_qrs(DB_PATH, DB_TABLE, QR_COL, APPROVED_COL)
+if SKIP_QRS:
+    print(f"Approval filter loaded: {len(SKIP_QRS)} QR(s) will be skipped (Approved=1).")
 
 # --- [3] Group files by QR ---
 pattern = re.compile(
-    r"^(\d+)\s+"
-    r"(\d+(?:-\d+)?)\s+"
-    r"(BF)\s*-\s*([013])$",
+    r"^(\d+)\s+"            # QR (digits, zero-padded)
+    r"(\d+(?:-\d+)?)\s+"    # Building (digits, optional -digits)
+    r"(BF)\s*-\s*([013])$", # BF - sequence (0/1/3)
     re.IGNORECASE
 )
 
@@ -99,18 +102,17 @@ for fn in os.listdir(image_folder):
     if not m:
         print(f"⚠ Skipping unrecognized filename: {fn}")
         continue
+
     qr, building, asset_type, seq = m.groups()
     if seq not in VALID_SUFFIXES or asset_type.upper() != "BF":
         continue
 
-    # NEW: skip here if already approved in DB
-    # qr strings in filenames are zero-padded digits, matching DB entries like '0000177276'
-    if qr in APPROVED_QRS:
-        # We still record nothing about it in grouped; just skip entirely
+    # Skip if Approved == 1 in sdi_dataset
+    if qr in SKIP_QRS:
         print(f"⏭️  Skipping QR {qr} (Approved=1 in DB)")
         continue
 
-    grouped[qr]["building"] = building
+    grouped[qr]["building"]    = building
     grouped[qr]["images"][seq] = os.path.join(image_folder, fn)
 
 print(f"\nTotal assets found (after approval filter): {len(grouped)}")
@@ -228,8 +230,8 @@ Do not include any text before or after the JSON.
 
 # --- [5] Process each asset ---
 for qr, info in grouped.items():
-    # Double-guard (if grouping step changed in the future)
-    if qr in APPROVED_QRS:
+    # Double guard in case grouping changes later
+    if qr in SKIP_QRS:
         print(f"⏭️  Skipping QR {qr} (Approved=1 in DB)")
         continue
 
