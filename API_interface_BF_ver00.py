@@ -20,20 +20,24 @@ import pytesseract
 import sqlite3
 from contextlib import closing
 
-# Point pytesseract to your installed Tesseract OCR exe
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\gandrade\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+import platform, shutil, pytesseract
+if platform.system() == "Windows":
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+else:
+    pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract") or "tesseract"
+
 
 # --- [1] Load API key ---
-load_dotenv(dotenv_path=r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\QR_code_project\API\OpenAI_key_bryan.env")
+load_dotenv(dotenv_path=r"/home/developer/API/OpenAI_key_bryan.env") # adjust as needed
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # --- [2] Paths & constants ---
-image_folder  = r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\QR_code_project\Capture_photos_upload"
-output_folder = r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\QR_code_project\API\Output_jason_api"
+image_folder  = r"/home/developer/Capture_photos_upload"
+output_folder = r"/home/developer/Output_jason_api"
 os.makedirs(output_folder, exist_ok=True)
 
 # NEW: DB path (SQLite)
-DB_PATH  = r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\Git_control\asset_capture_app_dev\data\QR_codes.db"
+DB_PATH  = r"/home/developer/asset_capture_app_dev/data/QR_codes.db"
 DB_TABLE = "sdi_dataset"   # uses a spaced QR column name: "QR Code"
 QR_COL   = '"QR Code"'     # quoted identifier for SQLite
 APPROVED_COL = '"Approved"'

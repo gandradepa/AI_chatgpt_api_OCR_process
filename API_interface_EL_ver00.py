@@ -19,7 +19,12 @@ import pytesseract
 import sqlite3
 from contextlib import closing
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\gandrade\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+import platform, shutil, pytesseract
+if platform.system() == "Windows":
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+else:
+    pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract") or "tesseract"
+
 
 # --- [1] Load API key ---
 load_dotenv(dotenv_path=r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\QR_code_project\API\OpenAI_key_bryan.env")
