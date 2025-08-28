@@ -27,7 +27,7 @@ else:
 
 
 # --- [1] Load API key ---
-load_dotenv(dotenv_path=r"/home/developer/API/OpenAI_key_bryan.env")
+load_dotenv(dotenv_path=r"S:\MaintOpsPlan\AssetMgt\Asset Management Process\Database\8. New Assets\Git_control\QR_code_project_API\OpenAI_key_bryan.env")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # --- [2] Paths & constants ---
