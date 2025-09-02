@@ -1,91 +1,207 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import json
-import base64
 import re
+import json
 import time
-from collections import defaultdict
+import base64
+import shutil
+import sqlite3
+import platform
 from typing import Dict, List, Tuple, Optional
+from contextlib import closing
+from collections import defaultdict
 
-from dotenv import load_dotenv
-from openai import OpenAI
-
-# --- OCR / image libs ---
+# OCR / image libs
 import cv2
 import numpy as np
 from PIL import Image  # noqa: F401
 import pytesseract
 
-# NEW: database
-import sqlite3
-from contextlib import closing
+# OpenAI
+from dotenv import load_dotenv
+from openai import OpenAI
 
-# -----------------------------
+# =============================================================================
 # CONFIG
-# -----------------------------
-import platform, shutil, pytesseract
+# =============================================================================
+
+# Tesseract path
 if platform.system() == "Windows":
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 else:
     pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract") or "tesseract"
 
-# --- [1] Load API key ---
-load_dotenv(dotenv_path=r"/home/developer/API/OpenAI_key_bryan.env") # adjust as needed
+# OpenAI key
+load_dotenv(dotenv_path=r"/home/developer/API/OpenAI_key_bryan.env")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- [2] Paths & constants ---
-image_folder  = r"/home/developer/Capture_photos_upload"
-output_folder = r"/home/developer/Output_jason_api"
-debug_folder  = os.path.join(output_folder, "debug_el")
-os.makedirs(output_folder, exist_ok=True)
-os.makedirs(debug_folder, exist_ok=True)
+# Paths
+IMAGE_DIR   = r"/home/developer/Capture_photos_upload"
+OUTPUT_DIR  = r"/home/developer/Output_jason_api"
+DEBUG_DIR   = os.path.join(OUTPUT_DIR, "debug_el")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
 
-# NEW: DB path (SQLite)
-DB_PATH = r"/home/developer/asset_capture_app_dev/data/QR_codes.db"
-DB_TABLE = "QR_codes"
+# DB: use sdi_dataset_EL (Approved rule lives here)
+DB_PATH  = r"/home/developer/asset_capture_app_dev/data/QR_codes.db"
+DB_TABLE = "sdi_dataset_EL"
 
-# Accept EL - 0, EL - 1, EL - 2
+# Accept EL - 0 / 1 / 2
 VALID_SUFFIXES = {"0", "1", "2"}
-VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+VALID_EXTS     = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# Header crop fraction for EL-2 (top 25%)
+# Crop fraction for header on EL - 0 (top 25%)
 HEADER_FRACTION = 0.25
 
-# Candidate regex for EL-1 tag — require at least one digit to avoid "LO OY"
-UBC_TAG_CANDIDATE = re.compile(r"\b([A-Z]{2,5})[ -]?(?=[A-Z0-9]*\d)[A-Z0-9]{2,8}\b")
+# UBC Tag must contain at least one digit (avoid false positives like "LO OY")
+UBC_TAG_CANDIDATE = re.compile(r"\b([A-Z]{2,5})[ -]?(?=[A-Z0-9]*\d)[A-Z0-9]{2,12}\b")
 
-# -----------------------------
-# DB helpers
-# -----------------------------
-def load_approved_qrs(db_path: str, table: str = "QR_codes") -> set:
-    approved = set()
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _normalize_qr(s: str) -> str:
+    """Normalize QR for comparison by stripping leading zeros (keep only digits up front)."""
+    s = str(s).strip()
+    m = re.match(r"\d+", s)
+    if not m:
+        return s
+    core = m.group(0).lstrip("0")
+    return core or "0"
+
+def _detect_columns(conn: sqlite3.Connection, table: str) -> Tuple[str, str]:
+    """
+    Find the QR code column and Approved column in `table`.
+    Prefer: "QR Code", fallback: "QR_code_ID", etc. Approved column must be "Approved".
+    Returns exact names from DB: (qr_col, approved_col).
+    """
+    wanted_qr_names = {"QR Code", "QR_code_ID", "QRCode", "QR", "QR_code"}
+    wanted_approved_names = {"Approved"}
+
+    cols = {}
+    cur = conn.execute(f'PRAGMA table_info("{table}")')
+    for _, name, *_ in cur.fetchall():
+        cols[name.lower()] = name
+
+    qr_col = None
+    for cand in wanted_qr_names:
+        if cand.lower() in cols:
+            qr_col = cols[cand.lower()]
+            break
+    if not qr_col:
+        raise RuntimeError(f"Could not find QR column in {table}. Tried {sorted(wanted_qr_names)}")
+
+    approved_col = None
+    for cand in wanted_approved_names:
+        if cand.lower() in cols:
+            approved_col = cols[cand.lower()]
+            break
+    if not approved_col:
+        raise RuntimeError(f"Could not find 'Approved' column in {table}")
+
+    return qr_col, approved_col
+
+def load_eligible_qrs(db_path: str, table: str) -> set:
+    """
+    Return set of QRs (normalized) that MUST be processed:
+    rows where Approved == 1 or '1' in sdi_dataset_EL.
+    """
+    eligible = set()
     if not os.path.exists(db_path):
-        print(f"⚠ DB not found: {db_path}. Proceeding without approval filter.")
-        return approved
+        print(f"❌ DB not found: {db_path}. No items will be processed.")
+        return eligible
+
     try:
         with closing(sqlite3.connect(db_path)) as conn:
             conn.row_factory = sqlite3.Row
-            with closing(conn.cursor()) as cur:
-                cur.execute(f"""
-                    SELECT QR_code_ID
-                    FROM {table}
-                    WHERE (Approved = 1 OR Approved = '1')
-                """)
-                for row in cur.fetchall():
-                    qrid = str(row["QR_code_ID"]).strip()
-                    if qrid:
-                        approved.add(qrid)
+            qr_col, approved_col = _detect_columns(conn, table)
+            sql = f'''
+                SELECT "{qr_col}" AS qr
+                FROM "{table}"
+                WHERE {approved_col} = 1 OR {approved_col} = '1'
+            '''
+            for row in conn.execute(sql):
+                qr_raw = str(row["qr"]).strip()
+                if qr_raw:
+                    eligible.add(_normalize_qr(qr_raw))
     except Exception as e:
-        print(f"⚠ Error reading approvals from DB: {e}. Proceeding without approval filter.")
-    return approved
+        print(f"❌ Error reading approvals from DB ({table}): {e}")
+        return set()
 
-APPROVED_QRS = load_approved_qrs(DB_PATH, DB_TABLE)
-if APPROVED_QRS:
-    print(f"Approval filter loaded: {len(APPROVED_QRS)} QR(s) will be skipped.")
+    return eligible
 
-# -----------------------------
-# Group files by QR
-# Filename pattern: "<QR> <Building> EL - <Sequence>"
-# -----------------------------
+def encode_image_from_path(image_path: str) -> Optional[str]:
+    try:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+            return f"data:image/jpeg;base64,{b64}"
+    except Exception as e:
+        print(f"❌ encode_image_from_path({image_path}) failed: {e}")
+        return None
+
+def encode_image_from_ndarray(img: np.ndarray) -> Optional[str]:
+    try:
+        ok, buf = cv2.imencode(".jpg", img)
+        if not ok:
+            return None
+        b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception as e:
+        print(f"❌ encode_image_from_ndarray failed: {e}")
+        return None
+
+def crop_header_top(image_path: str, fraction: float = HEADER_FRACTION) -> Optional[np.ndarray]:
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+        h = img.shape[0]
+        crop_h = max(1, int(h * fraction))
+        header = img[:crop_h, :, :]
+        # save debug
+        debug_name = os.path.join(DEBUG_DIR, f"header_{os.path.basename(image_path)}")
+        cv2.imwrite(debug_name, header)
+        return header
+    except Exception as e:
+        print(f"❌ crop_header_top({image_path}) failed: {e}")
+        return None
+
+def quick_ocr_text(img_path: str) -> str:
+    try:
+        img = cv2.imread(img_path)
+        if img is None:
+            return ""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY)[1]
+        # optional: slight dilation can help
+        text = pytesseract.image_to_string(gray, config="--psm 6")
+        return text or ""
+    except Exception as e:
+        print(f"❌ quick_ocr_text failed on {img_path}: {e}")
+        return ""
+
+def find_ubc_tag_hint_from_el1(img_path: Optional[str]) -> str:
+    if not img_path:
+        return ""
+    text = quick_ocr_text(img_path).upper()
+    # Look for a candidate with at least one digit
+    match = UBC_TAG_CANDIDATE.search(text)
+    return match.group(0) if match else ""
+
+# =============================================================================
+# LOAD ELIGIBLE QRS
+# =============================================================================
+
+ELIGIBLE_QRS = load_eligible_qrs(DB_PATH, DB_TABLE)
+print(f"Approval filter loaded from {DB_TABLE}: {len(ELIGIBLE_QRS)} QR(s) will be PROCESSED.")
+
+# =============================================================================
+# GROUP FILES BY QR
+# Filename pattern: "<QR> <Building> EL - <0|1|2>.<ext>"
+# =============================================================================
+
 pattern = re.compile(
     r"^(\d+)\s+"
     r"(\d+(?:-\d+)?)\s+"
@@ -93,375 +209,187 @@ pattern = re.compile(
     re.IGNORECASE
 )
 
-grouped = defaultdict(lambda: {"images": {}, "building": "", "asset_type": "EL"})
+groups: Dict[str, Dict] = defaultdict(lambda: {"building": "", "images": {}, "asset_type": "EL"})
 
-for fn in os.listdir(image_folder):
+for fn in os.listdir(IMAGE_DIR):
     base, ext = os.path.splitext(fn)
     if ext.lower() not in VALID_EXTS:
         continue
     m = pattern.match(base)
     if not m:
         continue
+
     qr, building, asset_type, seq = m.groups()
     if seq not in VALID_SUFFIXES or asset_type.upper() != "EL":
         continue
 
-    # Skip if Approved=1
-    if qr in APPROVED_QRS:
-        print(f"⏭️  Skipping QR {qr} (Approved=1 in DB)")
+    # Only process Approved=1
+    if ELIGIBLE_QRS and _normalize_qr(qr) not in ELIGIBLE_QRS:
         continue
 
-    grouped[qr]["building"] = building
-    grouped[qr]["images"][seq] = os.path.join(image_folder, fn)
+    groups[qr]["building"] = building
+    groups[qr]["images"][seq] = os.path.join(IMAGE_DIR, fn)
 
-print(f"\nTotal assets found (after approval filter): {len(grouped)}")
+print(f"Total assets to process (Approved=1): {len(groups)}")
 
-# -----------------------------
-# General helpers
-# -----------------------------
-def normalize_code(s: str) -> str:
-    """Uppercase, collapse spaces, normalize dashes."""
-    if not s:
-        return ""
-    s = s.replace("—", "-").replace("–", "-")
-    s = re.sub(r"\s+", " ", s).strip().upper()
-    return s
+# =============================================================================
+# MAIN LOOP
+# =============================================================================
 
-def is_reasonable_tag(s: str) -> bool:
-    """
-    Heuristics for a valid UBC Asset Tag:
-    - Has at least one digit
-    - Only A-Z, 0-9, spaces, or single dashes
-    - Length not too short/long
-    - Not just two short words with no digits (e.g., 'LO OY')
-    """
-    if not s:
-        return False
-    if len(s) < 3 or len(s) > 16:
-        return False
-    if re.search(r"[^A-Z0-9 \-]", s):
-        return False
-    if not re.search(r"\d", s):
-        return False
-    if re.fullmatch(r"[A-Z]{1,3}\s+[A-Z]{1,3}", s):
-        return False
-    return True
+for qr, info in groups.items():
+    building = info.get("building", "")
+    paths = info.get("images", {})
+    print(f"\n📦 Processing QR {qr} (Building {building}) ...")
 
-# -----------------------------
-# Image / OCR helpers
-# -----------------------------
-def encode_image(path: str) -> str:
-    ext = os.path.splitext(path)[1].lower()
-    mime = {
-        ".jpg":  "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png":  "image/png",
-        ".bmp":  "image/bmp",
-        ".webp": "image/webp"
-    }.get(ext, "application/octet-stream")
-    with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
+    # Prepare image payloads in recommended order:
+    # 1) Header crop from EL - 0 (for Branch Panel, Supply From, Volts, Location, Ampere)
+    # 2) EL - 1 (UBC Asset Tag)
+    # 3) EL - 2 (spare / additional context)
+    image_messages: List[Dict] = []
 
-def ocr_basic(image_bgr: np.ndarray) -> str:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    thr = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 5
-    )
-    txt = pytesseract.image_to_string(thr)
-    return txt
-
-def crop_header(image_bgr: np.ndarray) -> np.ndarray:
-    h, w = image_bgr.shape[:2]
-    h_head = max(40, int(h * HEADER_FRACTION))
-    return image_bgr[0:h_head, 0:w].copy()
-
-def draw_header_overlay(image_bgr: np.ndarray, header_bgr: np.ndarray, header_text: str) -> np.ndarray:
-    out = image_bgr.copy()
-    h, w = image_bgr.shape[:2]
-    h_head = header_bgr.shape[0]
-    overlay = out.copy()
-    cv2.rectangle(overlay, (0, 0), (w, h_head), (0, 255, 0), thickness=-1)
-    out = cv2.addWeighted(overlay, 0.15, out, 0.85, 0)
-    snippet = (header_text or "").strip().replace("\n", " ")
-    snippet = snippet[:120] + ("..." if len(snippet) > 120 else "")
-    cv2.putText(out, snippet, (10, min(h_head-10, 40)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 120, 30), 2, cv2.LINE_AA)
-    return out
-
-def find_text_boxes(image_bgr: np.ndarray) -> List[Tuple[int,int,int,int]]:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    inv = 255 - thr
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-    morph = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, kernel, iterations=2)
-    contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        if w > 50 and h > 12:
-            boxes.append((x, y, w, h))
-    return boxes
-
-def add_boxes_overlay(image_bgr: np.ndarray, boxes: List[Tuple[int,int,int,int]]) -> np.ndarray:
-    out = image_bgr.copy()
-    for (x, y, w, h) in boxes:
-        cv2.rectangle(out, (x, y), (x+w, y+h), (255, 0, 0), 2)
-    return out
-
-# -----------------------------
-# OpenAI helpers (Vision)
-# -----------------------------
-def call_openai_structured_header(image_path: str) -> Dict[str, str]:
-    """
-    Ask the model to read ONLY the header from an EL schedule (EL - 2).
-    Returns: Branch Panel, Location, Supply From, Volts, Ampere
-    """
-    prompt = (
-        "You are reading the HEADER ONLY of an electrical panel schedule image. "
-        "Ignore the table rows, breakers, and all details below the header line. "
-        "Extract these fields from the header:\n"
-        "- Branch Panel (e.g., 2NRM1, CDP 2N0D1)\n"
-        "- Location (e.g., Mechanical 7000)\n"
-        "- Supply From (e.g., CAD2)\n"
-        "- Volts (e.g., 120/208, 347/600)\n"
-        "- Ampere (e.g., 100 A, 225A)\n\n"
-        "Rules:\n"
-        "1) Return ONLY a compact JSON object with keys exactly: "
-        "{\"Branch Panel\", \"Location\", \"Supply From\", \"Volts\", \"Ampere\"}\n"
-        "2) Use strings for all values. If unknown, use empty string.\n"
-        "3) Do not add extra keys or explanations.\n"
-        "4) If the Branch Panel shows a prefix like 'Panel', exclude the word 'Panel'. "
-        "Return just the code (e.g., 'CDP 2N0D1').\n"
-    )
-
-    image_b64 = encode_image(image_path)
-
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You extract structured fields from images precisely and return strict JSON."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": image_b64}},
-                    ]
-                }
-            ],
-            temperature=0.0,
-            max_tokens=200,
-        )
-        txt = resp.choices[0].message.content.strip()
-        m = re.search(r"\{.*\}", txt, re.DOTALL)
-        if m:
-            parsed = json.loads(m.group(0))
-            return {
-                "Branch Panel": parsed.get("Branch Panel", "").strip(),
-                "Location": parsed.get("Location", "").strip(),
-                "Supply From": parsed.get("Supply From", "").strip(),
-                "Volts": parsed.get("Volts", "").strip(),
-                "Ampere": parsed.get("Ampere", "").strip(),
-            }
-    except Exception as e:
-        print(f"⚠ OpenAI header extraction error: {e}")
-    return {"Branch Panel":"", "Location":"", "Supply From":"", "Volts":"", "Ampere":""}
-
-def call_openai_tag(image_path: str) -> str:
-    """
-    Read UBC Asset Tag on EL - 1 (e.g., 'CDP 2N0D1'). Return ONLY the tag text.
-    """
-    prompt = (
-        "Read the asset tag shown in this image. It usually looks like a code such as 'CDP 2N0D1'. "
-        "Return ONLY the tag text as a single line. Do not include the word 'Panel'. "
-        "If uncertain, return an empty string."
-    )
-    image_b64 = encode_image(image_path)
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You read single short codes from images and return exactly the code."},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type":"text", "text": prompt},
-                        {"type":"image_url", "image_url": {"url": image_b64}},
-                    ],
-                },
-            ],
-            temperature=0.0,
-            max_tokens=30,
-        )
-        txt = (resp.choices[0].message.content or "").strip()
-        txt = re.sub(r"[\n\r]", " ", txt)
-        txt = re.sub(r"(?i)^panel\s*[-–—]\s*", "", txt).strip()
-        return txt
-    except Exception as e:
-        print(f"⚠ OpenAI tag error: {e}")
-        return ""
-
-# -----------------------------
-# OCR fallback parsing
-# -----------------------------
-def parse_header_text_freeform(text: str) -> Dict[str, str]:
-    """
-    Very lenient free-text parser for header fields (OCR fallback).
-    """
-    flat = " ".join(text.split())
-    out = {"Branch Panel":"", "Location":"", "Supply From":"", "Volts":"", "Ampere":""}
-
-    # Branch Panel: like 'CDP 2N0D1' or '2NRM1'
-    m_bp = re.search(r"\b([A-Z]{2,4}\s*[A-Z0-9]{2,6}|[A-Z0-9]{4,6})\b", flat)
-    if m_bp:
-        out["Branch Panel"] = m_bp.group(0).strip()
-
-    # Volts: like 120/208
-    m_volt = re.search(r"\b(\d{3}\/\d{3}|\d{3}\/\d{2,3})\b", flat)
-    if m_volt:
-        out["Volts"] = m_volt.group(0)
-
-    # Ampere: like 100 A, 225A
-    m_amp = re.search(r"\b(\d{2,4})\s*A\b", flat, re.IGNORECASE) or re.search(r"\b(\d{2,4})A\b", flat, re.IGNORECASE)
-    if m_amp:
-        out["Ampere"] = f"{m_amp.group(1)} A"
-
-    # Supply From: short code like CAD2
-    m_sup = re.search(r"\b([A-Z]{2,4}\s?\d{0,2}[A-Z]?)\b", flat)
-    if m_sup:
-        out["Supply From"] = m_sup.group(0).strip()
-
-    # Location: phrase after 'Location'
-    m_loc = re.search(r"(?i)location[:\-\s]+([A-Za-z0-9 \-_/]+)", flat)
-    if m_loc:
-        out["Location"] = m_loc.group(1).strip()
-
-    return out
-
-def tesseract_read_text(image_bgr: np.ndarray) -> str:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.medianBlur(gray, 3)
-    thr = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    txt = pytesseract.image_to_string(thr)
-    return txt
-
-def tesseract_read_tag(image_bgr: np.ndarray) -> str:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    txt = pytesseract.image_to_string(thr)
-    m = UBC_TAG_CANDIDATE.search(" ".join(txt.split()))
-    return m.group(0) if m else ""
-
-# -----------------------------
-# Main per-asset processing
-# -----------------------------
-for qr, info in grouped.items():
-    if qr in APPROVED_QRS:
-        print(f"⏭️  Skipping QR {qr} (Approved=1 in DB)")
-        continue
-
-    print(f"\nProcessing QR {qr} …")
-
-    # Final EL structure
-    result = {
-        "Description": "",       # will derive after we know the tag
-        "UBC Asset Tag": "",     # from EL - 1 (fallback to Branch Panel)
-        "Branch Panel": "",
-        "Ampere": "",
-        "Supply From": "",
-        "Volts": "",
-        "Location": "",
-    }
-
-    # --- 1) Extract header fields from EL - 2 (to have Branch Panel for fallback) ---
-    if "2" in info["images"]:
-        path_el2 = info["images"]["2"]
-        img2 = cv2.imread(path_el2)
-        if img2 is None:
-            print(f"⚠ Could not read EL-2 image for QR {qr}")
+    # Header crop from EL - 0
+    el0_path = paths.get("0")
+    if el0_path:
+        header_img = crop_header_top(el0_path, HEADER_FRACTION)
+        if header_img is not None:
+            enc = encode_image_from_ndarray(header_img)
+            if enc:
+                image_messages.append({"type": "image_url", "image_url": {"url": enc}})
         else:
-            header = crop_header(img2)
+            # fallback: send full image if crop failed
+            enc0 = encode_image_from_path(el0_path)
+            if enc0:
+                image_messages.append({"type": "image_url", "image_url": {"url": enc0}})
 
-            header_fields = call_openai_structured_header(path_el2)
+    # EL - 1 (UBC Tag plate)
+    el1_path = paths.get("1")
+    if el1_path:
+        enc1 = encode_image_from_path(el1_path)
+        if enc1:
+            image_messages.append({"type": "image_url", "image_url": {"url": enc1}})
 
-            # OCR fallback for any missing key
-            if any(not header_fields.get(k, "") for k in ["Branch Panel","Location","Supply From","Volts","Ampere"]):
-                ocr_txt = ocr_basic(header)
-                parsed = parse_header_text_freeform(ocr_txt)
-                for k in header_fields:
-                    if not header_fields.get(k):
-                        header_fields[k] = parsed.get(k, "")
+    # EL - 2 (optional)
+    el2_path = paths.get("2")
+    if el2_path:
+        enc2 = encode_image_from_path(el2_path)
+        if enc2:
+            image_messages.append({"type": "image_url", "image_url": {"url": enc2}})
 
-            # Assign to result
-            result["Branch Panel"] = header_fields.get("Branch Panel", "")
-            result["Location"]     = header_fields.get("Location", "")
-            result["Supply From"]  = header_fields.get("Supply From", "")
-            result["Volts"]        = header_fields.get("Volts", "")
-            result["Ampere"]       = header_fields.get("Ampere", "")
+    if not image_messages:
+        print(f"⚠️ No usable images for QR {qr}. Skipping.")
+        continue
 
-            # Visual debug overlays
-            header_txt = ocr_basic(header)
-            overlay = draw_header_overlay(img2, header, header_txt)
-            boxes2 = find_text_boxes(header)
-            overlay2 = add_boxes_overlay(overlay, boxes2)
-            cv2.imwrite(os.path.join(debug_folder, f"{qr}_EL2_header_overlay.jpg"), overlay2)
-            cv2.imwrite(os.path.join(debug_folder, f"{qr}_EL2_header_crop.jpg"), header)
+    # UBC Tag hint from EL - 1 OCR (helps the model, still validated later)
+    ubc_tag_hint = find_ubc_tag_hint_from_el1(el1_path)
 
-            print(f"  → Header fields: {header_fields}")
+    # Prompt (EL-specific)
+    prompt = f"""
+You will see up to three images for an ELECTRICAL PANEL:
 
-    # --- 2) Extract UBC Asset Tag from EL - 1 (preferred) ---
-    ubc_tag_raw = ""
-    if "1" in info["images"]:
-        path_tag = info["images"]["1"]
-        img_tag = cv2.imread(path_tag)
+• First image: a HEADER CROP from the panel schedule (EL - 0) — extract from the HEADER ONLY.
+• Second image: UBC Asset Tag label (EL - 1) — primary source for the UBC Asset Tag.
+• Third image: optional context (EL - 2).
 
-        # Try OCR first
-        tag_ocr = tesseract_read_tag(img_tag)
-        # If OCR weak/empty, ask LLM
-        tag_model = ""
-        if not tag_ocr:
-            tag_model = call_openai_tag(path_tag)
+Extract ONLY these fields (use exact field names):
 
-        ubc_tag_raw = (tag_ocr or tag_model).strip()
-        ubc_tag_raw = re.sub(r"(?i)^panel\s*[-–—]\s*", "", ubc_tag_raw).strip()
+- Description
+- UBC Asset Tag
+- Branch Panel
+- Ampere
+- Supply From
+- Volts
+- Location
 
-        # Debug overlays for EL-1
-        boxes = find_text_boxes(img_tag)
-        tag_overlay = add_boxes_overlay(img_tag, boxes)
-        cv2.imwrite(os.path.join(debug_folder, f"{qr}_EL1_tag_overlay.jpg"), tag_overlay)
-        cv2.imwrite(os.path.join(debug_folder, f"{qr}_EL1_tag_raw.jpg"), img_tag)
+Rules:
+1) "UBC Asset Tag": take from EL - 1. If not found or it contains no digits, LEAVE IT EMPTY for now.
+2) "Branch Panel", "Ampere", "Supply From", "Volts", "Location": read from the HEADER of EL - 0 (top of the document).
+3) "Description" must be: "Panel - <UBC Asset Tag>" AFTER any fallback is applied.
+4) If a value is missing or unreadable, return an empty string.
+5) Return a STRICT JSON object – no markdown, no commentary.
 
-        print(f"  → EL-1 tag candidates: OCR='{tag_ocr}' | LLM='{tag_model}' | chosen(raw)='{ubc_tag_raw}'")
+Assistive hint (may be empty): UBC Asset Tag hint = "{ubc_tag_hint}"
+    """.strip()
 
-    # --- 3) Finalize UBC Asset Tag with validation & fallback to Branch Panel ---
-    bp = normalize_code(result.get("Branch Panel", ""))
-    tag_candidate = normalize_code(ubc_tag_raw)
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}] + image_messages}],
+            max_tokens=800,
+            temperature=0.1,
+        )
+        reply = response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"❌ OpenAI error on QR {qr}: {e}")
+        continue
 
-    if is_reasonable_tag(tag_candidate):
-        chosen_tag = tag_candidate
+    # Save raw
+    raw_path = os.path.join(OUTPUT_DIR, f"{qr}_raw_ocr.txt")
+    with open(raw_path, "w", encoding="utf-8") as rf:
+        rf.write(reply)
+
+    # Strip codefences if present
+    if reply.startswith("```json"):
+        reply = reply[7:].strip()
+    elif reply.startswith("```"):
+        reply = reply[3:].strip()
+    if reply.endswith("```"):
+        reply = reply[:-3].strip()
+
+    # Expected fields
+    fields = ["Description", "UBC Asset Tag", "Branch Panel", "Ampere", "Supply From", "Volts", "Location"]
+    data: Dict[str, str] = {k: "" for k in fields}
+
+    # Parse JSON
+    parsed = None
+    try:
+        parsed = json.loads(reply)
+    except Exception:
+        # keep parsed=None; we'll output raw_response
+        pass
+
+    if isinstance(parsed, dict):
+        for f in fields:
+            for k in parsed.keys():
+                if k.strip().lower() == f.lower():
+                    data[f] = str(parsed[k]).strip()
     else:
-        chosen_tag = bp  # EL-1 was junk → fallback to Branch Panel
+        data["raw_response"] = reply
 
-    result["UBC Asset Tag"] = chosen_tag  # no "Panel - " prefix here
+    # Post-processing:
+    # Ensure UBC Asset Tag contains a digit; else empty (we fallback to Branch Panel next)
+    ubc_val = data.get("UBC Asset Tag", "").upper().strip()
+    if not UBC_TAG_CANDIDATE.search(ubc_val):
+        ubc_val = ""
 
-    # --- 4) Derive Description = "Panel - <UBC Asset Tag>" ---
-    result["Description"] = f"Panel - {chosen_tag}" if chosen_tag else "Panel"
+    # If missing, fallback to Branch Panel
+    branch_panel = data.get("Branch Panel", "").upper().strip()
+    if not ubc_val and branch_panel:
+        ubc_val = branch_panel
 
-    # Save JSON output
-    output_data = {
-        "qr_code":         qr,
-        "building_number": info.get("building", ""),
-        "asset_type":      f"- {info.get('asset_type', 'EL').upper()}",
-        "structured_data": result
+    data["UBC Asset Tag"] = ubc_val
+
+    # Ensure Description = "Panel - <UBC Asset Tag>" (even if empty -> "Panel - ")
+    data["Description"] = f"Panel - {ubc_val}".strip()
+
+    # Normalize trivial values
+    for key in ["Ampere", "Supply From", "Volts", "Location", "Branch Panel"]:
+        val = str(data.get(key, "")).strip()
+        # Clean weird artifacts like single dots
+        if val == ".":
+            val = ""
+        data[key] = val
+
+    # Build final JSON
+    result = {
+        "qr_code": qr,                         # keep leading zeros from filename
+        "building_number": building,
+        "asset_type": "- EL",
+        "structured_data": data,
     }
 
-    json_filename = f"{qr}_{info.get('asset_type', 'EL').upper()}_{info.get('building', '')}.json"
-    out_path = os.path.join(output_folder, json_filename)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(output_data, f, indent=2, ensure_ascii=False)
-    print(f"  ✅ Saved {out_path}")
+    out_path = os.path.join(OUTPUT_DIR, f"{qr}.json")
+    with open(out_path, "w", encoding="utf-8") as jf:
+        json.dump(result, jf, ensure_ascii=False, indent=2)
+
+    print(f"✅ Saved: {out_path}")
+
